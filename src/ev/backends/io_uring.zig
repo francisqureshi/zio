@@ -22,6 +22,7 @@ const NetConnect = @import("../completion.zig").NetConnect;
 const NetAccept = @import("../completion.zig").NetAccept;
 const NetRecv = @import("../completion.zig").NetRecv;
 const NetSend = @import("../completion.zig").NetSend;
+const NetSendFile = @import("../completion.zig").NetSendFile;
 const NetRecvFrom = @import("../completion.zig").NetRecvFrom;
 const NetSendTo = @import("../completion.zig").NetSendTo;
 const NetRecvMsg = @import("../completion.zig").NetRecvMsg;
@@ -52,8 +53,28 @@ const PipeRead = @import("../completion.zig").PipeRead;
 const PipeWrite = @import("../completion.zig").PipeWrite;
 const PipeClose = @import("../completion.zig").PipeClose;
 const ProcessWait = @import("../completion.zig").ProcessWait;
+const splice_sm = @import("io_uring_net_send_file_sm.zig");
 
 pub const NetHandle = net.fd_t;
+
+// Splice flags (not exposed via std as of Zig 0.16; see SPLICE-PLAN §3).
+const SPLICE_F_MOVE: u32 = 0x01;
+// const SPLICE_F_NONBLOCK: u32 = 0x02; // unused; pipes are O_NONBLOCK already
+// const SPLICE_F_MORE: u32 = 0x04;     // see SPLICE-PLAN §12 decision 3 — not used
+
+// fcntl pipe-size commands.
+const F_SETPIPE_SZ: i32 = 1031;
+const F_GETPIPE_SZ: i32 = 1032;
+
+// Target pipe size per `NetSendFile` op — matches proto.CHUNK_SIZE used by
+// callers like zio-splice (see SPLICE-PLAN §12 decision 1). On kernels where
+// this exceeds `/proc/sys/fs/pipe-max-size` the kernel returns EPERM and we
+// fall back to whatever capacity it gave us.
+const PIPE_SIZE_REQUEST: u32 = 1 << 20;
+
+// Upper bound on the number of pipes the pool will allocate. Each pipe is a
+// pair of fds + ~1 MiB of kernel buffer when at full capacity.
+const PIPE_POOL_CAP: u32 = 16;
 
 const BackendCapabilities = @import("../completion.zig").BackendCapabilities;
 
@@ -77,9 +98,106 @@ pub const capabilities: BackendCapabilities = .{
     .dir_open = true,
     .dir_close = true,
     .process_wait = true,
+    .net_send_file = true,
 };
 
 pub const SharedState = struct {};
+
+pub const NetSendFileData = struct {
+    /// Pipe pair acquired for the duration of this op. `[0]` is the read end
+    /// (drained by splice→socket), `[1]` is the write end (filled by
+    /// splice→pipe). `-1` sentinel = no pipe currently held.
+    pipe: [2]linux.fd_t = .{ -1, -1 },
+    /// Pure state machine — see `io_uring_net_send_file_sm.zig`.
+    sm: splice_sm.State = .{},
+    /// True iff the inflight SQE is a POLL_ADD waiting for the file (for
+    /// `.splicing_in`) or socket (for `.splicing_out`) to become ready,
+    /// after the splice CQE returned EAGAIN. The next CQE belongs to the
+    /// poll, not to a splice — we use this flag to dispatch it correctly.
+    waiting_for_readiness: bool = false,
+};
+
+/// Per-ring pool of pipe pairs reused across `NetSendFile` ops. Single-issuer
+/// + DEFER_TASKRUN means submit/completion never run concurrently, so no lock.
+const PipePool = struct {
+    allocator: std.mem.Allocator,
+    free: std.ArrayListUnmanaged([2]linux.fd_t) = .empty,
+    /// Total pipes ever created (whether currently free or in flight).
+    allocated: u32 = 0,
+    /// Cap on `allocated`. Beyond this `acquire()` returns null and the op
+    /// goes onto `self.pending` to wait for a release.
+    cap: u32,
+    /// Kernel-reported capacity of pipes in this pool (read back via
+    /// F_GETPIPE_SZ on the first pipe). All pipes are created with the same
+    /// request so the size matches.
+    pipe_size: u32 = PIPE_SIZE_REQUEST,
+    /// True after `pipe_size` has been measured from a real pipe; false until
+    /// the first `acquire()` runs `F_GETPIPE_SZ`.
+    pipe_size_measured: bool = false,
+
+    fn init(allocator: std.mem.Allocator) PipePool {
+        return .{ .allocator = allocator, .cap = PIPE_POOL_CAP };
+    }
+
+    fn deinit(self: *PipePool) void {
+        for (self.free.items) |fds| {
+            _ = linux.close(fds[0]);
+            _ = linux.close(fds[1]);
+        }
+        self.free.deinit(self.allocator);
+    }
+
+    /// Returns a pipe pair, or null if the pool is at cap (caller defers).
+    /// Returns an error only if pipe creation syscalls fail.
+    fn acquire(self: *PipePool) !?[2]linux.fd_t {
+        if (self.free.pop()) |fds| return fds;
+        if (self.allocated >= self.cap) return null;
+
+        var fds: [2]i32 = undefined;
+        // Blocking pipe: with O_NONBLOCK set the kernel returns EAGAIN as
+        // soon as the source has no bytes or the sink is full, even from an
+        // io_uring SQE. We want io_uring to park the SQE until the leg
+        // makes progress (or it's canceled). Leaving the pipe blocking lets
+        // the kernel offload via IO-WQ instead of failing fast.
+        const flags: linux.O = .{ .CLOEXEC = true };
+        const rc = linux.pipe2(&fds, flags);
+        const rc_i: isize = @bitCast(rc);
+        if (rc_i < 0) {
+            const e: linux.E = @enumFromInt(@as(u32, @intCast(-rc_i)));
+            return switch (e) {
+                .MFILE, .NFILE => error.SystemResources,
+                else => error.Unexpected,
+            };
+        }
+
+        // Request the target pipe capacity. Failure is non-fatal — the SM
+        // already handles short splice_in legs by looping.
+        const set_rc = linux.fcntl(fds[1], F_SETPIPE_SZ, PIPE_SIZE_REQUEST);
+        _ = set_rc; // size mismatch is handled via the F_GETPIPE_SZ read below
+
+        if (!self.pipe_size_measured) {
+            const get_rc = linux.fcntl(fds[1], F_GETPIPE_SZ, 0);
+            const get_rc_i: isize = @bitCast(get_rc);
+            if (get_rc_i > 0) {
+                self.pipe_size = @intCast(get_rc_i);
+            }
+            self.pipe_size_measured = true;
+        }
+
+        self.allocated += 1;
+        return fds;
+    }
+
+    fn release(self: *PipePool, fds: [2]linux.fd_t) void {
+        self.free.append(self.allocator, fds) catch {
+            // Out of memory on the free list — close the pipes instead of
+            // leaking them.
+            _ = linux.close(fds[0]);
+            _ = linux.close(fds[1]);
+            self.allocated -= 1;
+        };
+    }
+};
 
 pub const NetRecvData = struct {
     msg: linux.msghdr = undefined,
@@ -162,6 +280,7 @@ allocator: std.mem.Allocator,
 ring: linux.IoUring,
 waker_needs_rearm: bool,
 pending: Queue(Completion) = .{},
+pipe_pool: PipePool,
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
     _ = shared_state;
@@ -177,10 +296,12 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_s
         .allocator = allocator,
         .ring = ring,
         .waker_needs_rearm = true,
+        .pipe_pool = PipePool.init(allocator),
     };
 }
 
 pub fn deinit(self: *Self) void {
+    self.pipe_pool.deinit();
     self.ring.deinit();
 }
 
@@ -725,10 +846,148 @@ pub fn submit(self: *Self, state: *LoopState, c: *Completion) void {
             sqe.user_data = @intFromPtr(c);
         },
         .device_io_control => unreachable, // Handled via thread pool
-        // Driven by Loop's generic read/write fallback, never reaches the backend.
-        .net_send_file => unreachable,
+        .net_send_file => {
+            const data = c.cast(NetSendFile);
+            if (data.internal.sm.phase == .initial) {
+                // First submission. Acquire a pipe pair; defer to `pending`
+                // if the pool is at cap. The op is not yet in the SQ so the
+                // SM stays in `.initial` and re-runs this arm on retry.
+                const maybe_pipe = self.pipe_pool.acquire() catch {
+                    c.setError(error.SystemResources);
+                    state.markCompletedFromBackend(c);
+                    return;
+                };
+                const pipe = maybe_pipe orelse {
+                    self.pending.push(c);
+                    return;
+                };
+                data.internal.pipe = pipe;
+                const action = data.internal.sm.start(data.offset, data.remaining, self.pipe_pool.pipe_size);
+                self.netSendFileApply(state, c, action);
+            } else {
+                // Resumed after SQ-full deferral. The SM state already
+                // reflects the SQE that should go out — read it back via
+                // `resumeAction()`. This is the fix for the SQ-full bug
+                // described in SPLICE-PLAN §13.
+                const action = data.internal.sm.resumeAction();
+                self.netSendFileApply(state, c, action);
+            }
+        },
         .mach_port => unreachable,
     }
+}
+
+/// Issue the SQE described by `action`, complete the op, or fail it.
+fn netSendFileApply(self: *Self, state: *LoopState, c: *Completion, action: splice_sm.Action) void {
+    const data = c.cast(NetSendFile);
+    switch (action) {
+        .submit_in => |a| {
+            const sqe = self.getSqeOrDefer(c) orelse return;
+            // `splice(file -> pipe[1])`. Pipe end has no seekable offset,
+            // pass -1 (maxInt(u64)) per splice(2). File offset uses the SM's
+            // tracking — kernel updates `offset` for the file fd implicitly
+            // since we pass an explicit value here.
+            sqe.prep_splice(
+                data.file,
+                data.internal.sm.offset,
+                data.internal.pipe[1],
+                std.math.maxInt(u64),
+                a.len,
+            );
+            sqe.rw_flags = SPLICE_F_MOVE;
+            sqe.user_data = @intFromPtr(c);
+        },
+        .submit_out => |a| {
+            const sqe = self.getSqeOrDefer(c) orelse return;
+            // `splice(pipe[0] -> socket)`. Both ends pipe/socket, neither
+            // seekable.
+            sqe.prep_splice(
+                data.internal.pipe[0],
+                std.math.maxInt(u64),
+                data.handle,
+                std.math.maxInt(u64),
+                a.len,
+            );
+            sqe.rw_flags = SPLICE_F_MOVE;
+            sqe.user_data = @intFromPtr(c);
+        },
+        .complete => |a| {
+            self.netSendFileReleasePipe(data);
+            c.setResult(.net_send_file, a.total);
+            state.markCompletedFromBackend(c);
+        },
+        .fail => |a| {
+            self.netSendFileReleasePipe(data);
+            const e: linux.E = @enumFromInt(@as(u32, @intCast(-a.errno)));
+            switch (e) {
+                .CANCELED => c.setError(error.Canceled),
+                else => {
+                    // Phase tells us which side produced the errno so we can
+                    // route to the correct error set.
+                    if (data.internal.sm.phase == .splicing_in) {
+                        c.setError(fs.errnoToFileReadError(e));
+                    } else {
+                        c.setError(net.errnoToSendError(e));
+                    }
+                },
+            }
+            state.markCompletedFromBackend(c);
+        },
+    }
+}
+
+/// Release any pipe held by this op back to the pool. Safe to call multiple
+/// times — uses the `-1` sentinel.
+fn netSendFileReleasePipe(self: *Self, data: *NetSendFile) void {
+    if (data.internal.pipe[0] < 0) return;
+    self.pipe_pool.release(data.internal.pipe);
+    data.internal.pipe = .{ -1, -1 };
+}
+
+/// Drive the SM with the CQE result. Called from `poll()` before the generic
+/// completion path because `NetSendFile` produces multiple CQEs per op.
+fn netSendFileOnCqe(self: *Self, state: *LoopState, c: *Completion, res: i32) void {
+    const data = c.cast(NetSendFile);
+
+    if (data.internal.waiting_for_readiness) {
+        // The CQE we just received is for a POLL_ADD we issued after the
+        // previous splice returned EAGAIN. Resume the splice (or fail if
+        // the poll itself was canceled).
+        data.internal.waiting_for_readiness = false;
+        if (res < 0) {
+            self.netSendFileApply(state, c, .{ .fail = .{ .errno = res } });
+            return;
+        }
+        const action = data.internal.sm.resumeAction();
+        self.netSendFileApply(state, c, action);
+        return;
+    }
+
+    // io_uring's SPLICE op does NOT auto-poll a non-blocking sink; it
+    // surfaces EAGAIN to userspace. Translate EAGAIN into "wait for the
+    // relevant fd to become ready, then retry the same SQE" via POLL_ADD.
+    // The SM doesn't see this CQE — its state is unchanged so resumeAction
+    // re-derives the original splice.
+    if (res == -@as(i32, @intFromEnum(linux.E.AGAIN))) {
+        const fd: linux.fd_t = switch (data.internal.sm.phase) {
+            .initial => unreachable,
+            .splicing_in => data.file,
+            .splicing_out => data.handle,
+        };
+        const poll_mask: u32 = switch (data.internal.sm.phase) {
+            .initial => unreachable,
+            .splicing_in => linux.POLL.IN,
+            .splicing_out => linux.POLL.OUT,
+        };
+        const sqe = self.getSqeOrDefer(c) orelse return;
+        sqe.prep_poll_add(fd, poll_mask);
+        sqe.user_data = @intFromPtr(c);
+        data.internal.waiting_for_readiness = true;
+        return;
+    }
+
+    const action = data.internal.sm.onCqe(res);
+    self.netSendFileApply(state, c, action);
 }
 
 /// Cancel a completion - infallible.
@@ -853,6 +1112,15 @@ pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
         // waker always gets priority over EINTR resubmissions.
         if (cqe.res == -@as(i32, @intFromEnum(linux.E.INTR))) {
             self.pending.push(completion);
+            continue;
+        }
+
+        // `net_send_file` is multi-CQE: drive the SM and possibly issue
+        // another SQE instead of going through the single-CQE path below.
+        // The SM owns calling `setResult`/`setError` + `markCompletedFromBackend`
+        // when the op finally finishes.
+        if (completion.op == .net_send_file) {
+            self.netSendFileOnCqe(state, completion, cqe.res);
             continue;
         }
 
@@ -1232,8 +1500,17 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
             }
         },
         .device_io_control => unreachable, // Handled via thread pool
-        // Driven by Loop's generic read/write fallback, never reaches the backend.
-        .net_send_file => unreachable,
+        .net_send_file => {
+            // Only the canceled-while-pending path reaches here (see
+            // `drainPending` calling `storeResult(c, -ECANCELED)`). The
+            // normal multi-CQE flow goes through `netSendFileOnCqe`.
+            const data = c.cast(NetSendFile);
+            self.netSendFileReleasePipe(data);
+            std.debug.assert(res < 0);
+            const e: linux.E = @enumFromInt(@as(u32, @intCast(-res)));
+            std.debug.assert(e == .CANCELED);
+            c.setError(error.Canceled);
+        },
         .mach_port => unreachable,
     }
 }
@@ -1300,4 +1577,8 @@ fn prep_openat2(sqe: *linux.io_uring_sqe, fd: linux.fd_t, path: [*:0]const u8, h
         .addr3 = 0,
         .resv = 0,
     };
+}
+
+test {
+    _ = @import("io_uring_net_send_file_sm.zig");
 }
