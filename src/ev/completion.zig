@@ -779,8 +779,10 @@ pub const NetSendFile = struct {
         send: NetSend = undefined,
         /// Two ping-pong transfer buffers (userspace equivalent of the splice
         /// pipe). One is filled by a read while the other is drained by a send.
-        /// Split 2x8K to keep the same total size as the single-buffer version.
-        bufs: [2][8 * 1024]u8 = undefined,
+        /// Bumped to 2x256K so a 1 MiB chunk takes 4 SQE pairs instead
+        /// of 128; closes the gap with std's read+write fallback at the
+        /// cost of an extra ~496 KiB per in-flight NetSendFile op.
+        bufs: [2][256 * 1024]u8 = undefined,
         /// Bytes available in each buffer (0 = empty/free).
         filled: [2]usize = .{ 0, 0 },
         /// Drain cursor within the buffer currently being sent.
